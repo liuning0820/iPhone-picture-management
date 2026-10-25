@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from unittest.mock import patch
 
 from iphone_copy import (
     IPhoneCopyError,
@@ -53,7 +54,16 @@ class FakeBackend:
         assert item.children is not None
         return item.children
 
-    def copy_file(self, item: FakeItem, destination_folder: Path) -> None:
+    def copy_file(
+        self,
+        source: SourceFile,
+        destination_folder: Path,
+        *,
+        timeout: float,
+        status_callback=None,
+    ) -> None:
+        item = source.native_item
+        assert isinstance(item, FakeItem)
         assert item.data is not None
         self.copy_calls.append(item.name)
         (destination_folder / item.name).write_bytes(item.data)
@@ -342,6 +352,67 @@ class WindowsMtpBackendCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(result, [good_item])
         self.assertEqual(folder.calls, 2)
+
+
+class BlockingCopyTimeoutTests(unittest.TestCase):
+    def test_windows_copy_terminates_a_worker_blocked_inside_copyhere(self) -> None:
+        class FakeQueue:
+            def get(self, timeout=None):
+                raise RuntimeError("empty")
+
+            def close(self):
+                pass
+
+            def join_thread(self):
+                pass
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.started = False
+                self.terminated = False
+                self.killed = False
+                self.exitcode = None
+
+            def start(self):
+                self.started = True
+
+            def is_alive(self):
+                return self.started and not self.terminated and not self.killed
+
+            def join(self, timeout=None):
+                pass
+
+            def terminate(self):
+                self.terminated = True
+                self.exitcode = -15
+
+            def kill(self):
+                self.killed = True
+                self.exitcode = -9
+
+        fake_process = FakeProcess()
+
+        class FakeContext:
+            @staticmethod
+            def Queue():
+                return FakeQueue()
+
+            @staticmethod
+            def Process(**kwargs):
+                return fake_process
+
+        backend = object.__new__(WindowsMtpBackend)
+        backend._device_name = "Apple iPhone"
+        backend._storage_name = "Internal Storage"
+        source = SourceFile(("202610_a", "IMG.MOV"), 10, object())
+
+        with patch("iphone_copy.multiprocessing.get_context", return_value=FakeContext()):
+            with self.assertRaisesRegex(IPhoneCopyError, "复制超时"):
+                backend.copy_file(source, Path("C:/destination"), timeout=0.001)
+
+        self.assertTrue(fake_process.started)
+        self.assertTrue(fake_process.terminated)
+        self.assertFalse(fake_process.killed)
 
 
 if __name__ == "__main__":

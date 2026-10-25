@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import gc
+import multiprocessing
 import os
 import re
 import sys
@@ -105,7 +106,14 @@ class SourceBackend(Protocol):
 
     def item_folder(self, item: Any) -> Any: ...
 
-    def copy_file(self, item: Any, destination_folder: Path) -> None: ...
+    def copy_file(
+        self,
+        source: SourceFile,
+        destination_folder: Path,
+        *,
+        timeout: float,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> None: ...
 
 
 class WindowsMtpBackend:
@@ -145,6 +153,8 @@ class WindowsMtpBackend:
             self._initialized = False
 
     def find_storage(self, device_name: str, storage_name: str) -> Any:
+        self._device_name = device_name
+        self._storage_name = storage_name
         drives = self._shell.NameSpace(self.SSF_DRIVES)
         if drives is None:
             raise IPhoneCopyError("无法打开 Windows 的“此电脑”。")
@@ -309,15 +319,132 @@ class WindowsMtpBackend:
         # and may return a string instead of the Folder object.
         return item.GetFolder
 
-    def copy_file(self, item: Any, destination_folder: Path) -> None:
-        destination = self._shell.NameSpace(str(destination_folder))
+    def copy_file(
+        self,
+        source: SourceFile,
+        destination_folder: Path,
+        *,
+        timeout: float,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> None:
+        device_name = getattr(self, "_device_name", None)
+        storage_name = getattr(self, "_storage_name", None)
+        if not device_name or not storage_name:
+            raise IPhoneCopyError("复制前尚未定位 iPhone 存储区。")
+
+        context = multiprocessing.get_context("spawn")
+        result_queue = context.Queue()
+        process = context.Process(
+            target=_copy_mtp_file_worker,
+            args=(
+                device_name,
+                storage_name,
+                source.relative_parts,
+                source.size,
+                str(destination_folder),
+                self.COPY_FLAGS,
+                result_queue,
+            ),
+            name=f"mtp-copy-{source.relative_parts[-1]}",
+        )
+        started = time.monotonic()
+        process.start()
+        next_status = started + 10.0
+        try:
+            while process.is_alive():
+                elapsed = time.monotonic() - started
+                if elapsed >= timeout:
+                    process.terminate()
+                    process.join(5)
+                    if process.is_alive():
+                        process.kill()
+                        process.join(5)
+                    raise IPhoneCopyError(
+                        f"复制超时，已终止卡住的 Windows MTP 调用: "
+                        f"{source.display_path}（等待 {timeout:g} 秒）。"
+                    )
+                if status_callback and time.monotonic() >= next_status:
+                    status_callback(f"仍在等待 Windows MTP（已等待 {elapsed:.0f} 秒）")
+                    next_status += 10.0
+                process.join(min(0.5, max(0.0, timeout - elapsed)))
+
+            message: tuple[str, str] | None = None
+            try:
+                message = result_queue.get(timeout=1)
+            except Exception:
+                pass
+            if message and message[0] == "ok":
+                return
+            if message and message[0] == "error":
+                raise IPhoneCopyError(
+                    f"复制失败: {source.display_path}；{message[1]}"
+                )
+            raise IPhoneCopyError(
+                f"复制进程异常结束: {source.display_path}；"
+                f"退出码 {process.exitcode}。"
+            )
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+            result_queue.close()
+            result_queue.join_thread()
+
+
+def _copy_mtp_file_worker(
+    device_name: str,
+    storage_name: str,
+    relative_parts: tuple[str, ...],
+    expected_size: int,
+    destination_folder: str,
+    copy_flags: int,
+    result_queue: Any,
+) -> None:
+    """Run one potentially blocking Shell CopyHere call in isolation."""
+
+    backend: WindowsMtpBackend | None = None
+    storage: Any = None
+    current_folder: Any = None
+    source_item: Any = None
+    try:
+        backend = WindowsMtpBackend()
+        storage = backend.find_storage(device_name, storage_name)
+        current_folder = storage
+        for component in relative_parts[:-1]:
+            folder_item = backend._find_named_item(current_folder, component, "源文件夹")
+            if not backend.item_is_folder(folder_item):
+                raise IPhoneCopyError(f"源路径组件不是文件夹: {component!r}")
+            current_folder = backend.item_folder(folder_item)
+        source_item = backend._find_named_item(
+            current_folder, relative_parts[-1], "源文件"
+        )
+
+        destination = backend._shell.NameSpace(destination_folder)
         if destination is None:
             raise IPhoneCopyError(f"Windows Shell 无法打开目标目录: {destination_folder}")
+        destination.CopyHere(source_item, copy_flags)
+
+        target = Path(destination_folder) / relative_parts[-1]
+        while not _file_has_expected_size(target, expected_size):
+            time.sleep(0.25)
+        result_queue.put(("ok", ""))
+    except BaseException as exc:
+        detail = (
+            WindowsMtpBackend._com_error_detail(exc)
+            if backend is not None
+            else " ".join(str(exc).split())
+        )
         try:
-            # CopyHere returns before an MTP transfer has necessarily completed.
-            destination.CopyHere(item, self.COPY_FLAGS)
-        except Exception as exc:
-            raise IPhoneCopyError(f"启动复制失败: {item.Name!r}") from exc
+            result_queue.put(("error", detail))
+        except Exception:
+            pass
+    finally:
+        source_item = None
+        current_folder = None
+        storage = None
+        gc.collect()
+        if backend is not None:
+            backend.close()
 
 
 def _validate_windows_component(name: str) -> None:
@@ -481,17 +608,23 @@ def copy_selection(
 
         if progress:
             progress(index, total, source, "复制中")
-        backend.copy_file(source.native_item, target.parent)
 
-        deadline = time.monotonic() + timeout
-        while not _file_has_expected_size(target, source.size):
-            if time.monotonic() >= deadline:
-                observed = target.stat().st_size if target.is_file() else "不存在"
-                raise IPhoneCopyError(
-                    f"等待复制超时: {source.display_path}；"
-                    f"期望 {source.size} 字节，当前 {observed}。"
-                )
-            time.sleep(poll_interval)
+        def report_waiting(status: str) -> None:
+            if progress:
+                progress(index, total, source, status)
+
+        backend.copy_file(
+            source,
+            target.parent,
+            timeout=timeout,
+            status_callback=report_waiting,
+        )
+        if not _file_has_expected_size(target, source.size):
+            observed = target.stat().st_size if target.is_file() else "不存在"
+            raise IPhoneCopyError(
+                f"复制调用结束但目标文件不完整: {source.display_path}；"
+                f"期望 {source.size} 字节，当前 {observed}。"
+            )
         copied += 1
 
     return copied, skipped
@@ -681,4 +814,5 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     raise SystemExit(main())
