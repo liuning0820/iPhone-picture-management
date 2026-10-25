@@ -144,8 +144,21 @@ before running the command again.
 - Reconnect the USB cable if the device or storage isn't listed.
 - Close File Explorer windows that are actively copying from the iPhone.
 - Increase the per-file timeout for a large video, for example,
-  `--timeout 1800`.
+  `--timeout 1800`. The timeout starts before Windows Shell `CopyHere`, so it
+  also stops an MTP call that hangs before creating the destination file.
+- If a photo or video is stored only in iCloud, open it on the iPhone and wait
+  for the full-resolution original to download before importing it. Apple
+  requires originals to be present on the device for Windows USB imports.
+- If Windows repeatedly fails to import videos, verify that File Explorer or
+  the Windows Photos app can copy the same file. For future captures, Apple
+  recommends **Settings > Camera > Formats > Most Compatible** for Windows
+  compatibility.
 - Use `--device-name` or `--storage-name` if Windows shows different names.
+
+While a file is pending, the command reports its elapsed MTP wait every 10
+seconds. If the timeout expires, it terminates the isolated copy process and
+stops with an error instead of waiting forever. Restarting the command is safe:
+files that already have the expected size are skipped.
 
 A failed or canceled run can leave a partial destination file. On the next run,
 the tool reports that file as a conflict. Inspect it, and then remove it or use
