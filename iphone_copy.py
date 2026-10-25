@@ -23,6 +23,18 @@ class IPhoneCopyError(RuntimeError):
     """A recoverable error that can be shown directly to the user."""
 
 
+def normalize_skip_extensions(values: Iterable[str]) -> frozenset[str]:
+    """Normalize extension filters to case-insensitive values without dots."""
+
+    normalized: set[str] = set()
+    for value in values:
+        extension = value[1:] if value.startswith(".") else value
+        if not extension:
+            raise ValueError("跳过扩展名不能为空。")
+        normalized.add(extension.casefold())
+    return frozenset(normalized)
+
+
 @dataclass(frozen=True)
 class Period:
     """A validated year (YYYY) or month (YYYYMM) selection."""
@@ -66,6 +78,7 @@ class SourceFile:
 class SourceSelection:
     folder_names: tuple[str, ...]
     files: tuple[SourceFile, ...]
+    skipped_count: int = 0
 
     @property
     def total_size(self) -> int:
@@ -457,9 +470,14 @@ def _validate_windows_component(name: str) -> None:
 
 
 def collect_source_selection(
-    backend: SourceBackend, storage_folder: Any, period: Period
+    backend: SourceBackend,
+    storage_folder: Any,
+    period: Period,
+    skip_extensions: Iterable[str] = (),
 ) -> SourceSelection:
     """Collect a stable source manifest before copying starts."""
+
+    normalized_skip_extensions = normalize_skip_extensions(skip_extensions)
 
     top_folders: list[Any] = []
     for item in backend.list_items(storage_folder):
@@ -473,9 +491,11 @@ def collect_source_selection(
         )
 
     files: list[SourceFile] = []
+    skipped_count = 0
     seen_paths: dict[tuple[str, ...], str] = {}
 
     def walk(folder: Any, parent_parts: tuple[str, ...]) -> None:
+        nonlocal skipped_count
         children = list(backend.list_items(folder))
         children.sort(key=lambda item: backend.item_name(item).casefold())
         for child in children:
@@ -484,6 +504,11 @@ def collect_source_selection(
             parts = parent_parts + (name,)
             if backend.item_is_folder(child):
                 walk(backend.item_folder(child), parts)
+                continue
+
+            extension = name.rsplit(".", 1)[-1] if "." in name else ""
+            if extension and extension.casefold() in normalized_skip_extensions:
+                skipped_count += 1
                 continue
 
             folded = tuple(part.casefold() for part in parts)
@@ -509,7 +534,11 @@ def collect_source_selection(
         folder_names.append(folder_name)
         walk(backend.item_folder(top_folder), (folder_name,))
 
-    return SourceSelection(folder_names=tuple(folder_names), files=tuple(files))
+    return SourceSelection(
+        folder_names=tuple(folder_names),
+        files=tuple(files),
+        skipped_count=skipped_count,
+    )
 
 
 def _windows_file_is_exclusively_readable(path: Path) -> bool:
@@ -743,6 +772,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="等待每个文件复制完成的秒数（默认: %(default)s）",
     )
     parser.add_argument(
+        "--skip-extension",
+        action="append",
+        default=[],
+        metavar="EXTENSION",
+        help="按扩展名跳过源文件；可重复指定，例如 .MOV 或 MOV",
+    )
+    parser.add_argument(
         "--list-only",
         action="store_true",
         help="只显示匹配结果，不复制",
@@ -757,6 +793,12 @@ def run(args: argparse.Namespace) -> int:
         raise IPhoneCopyError(str(exc)) from exc
     if args.timeout <= 0:
         raise IPhoneCopyError("--timeout 必须大于 0。")
+    try:
+        skip_extensions = normalize_skip_extensions(
+            getattr(args, "skip_extension", ())
+        )
+    except ValueError as exc:
+        raise IPhoneCopyError(str(exc)) from exc
 
     backend = WindowsMtpBackend()
     storage: Any = None
@@ -764,12 +806,22 @@ def run(args: argparse.Namespace) -> int:
     try:
         storage = backend.find_storage(args.device_name, args.storage_name)
         print("正在读取 iPhone 文件清单……", flush=True)
-        selection = collect_source_selection(backend, storage, period)
+        selection = collect_source_selection(
+            backend, storage, period, skip_extensions
+        )
         print(f"匹配文件夹: {', '.join(selection.folder_names)}")
         print(
             f"源文件合计: {len(selection.files)} 个，"
             f"{format_bytes(selection.total_size)}"
         )
+        if skip_extensions:
+            display_extensions = ", ".join(
+                f".{extension.upper()}" for extension in sorted(skip_extensions)
+            )
+            print(
+                f"按扩展名跳过: {selection.skipped_count} 个 "
+                f"（{display_extensions}）"
+            )
 
         if args.list_only:
             return 0

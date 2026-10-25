@@ -12,8 +12,10 @@ from iphone_copy import (
     SourceFile,
     SourceSelection,
     WindowsMtpBackend,
+    build_parser,
     collect_source_selection,
     copy_selection,
+    normalize_skip_extensions,
     verify_selection,
 )
 
@@ -69,6 +71,24 @@ class FakeBackend:
         (destination_folder / item.name).write_bytes(item.data)
 
 
+class CliAndExtensionTests(unittest.TestCase):
+    def test_parser_accepts_repeated_skip_extensions(self) -> None:
+        args = build_parser().parse_args(
+            ["202607", "--skip-extension", ".MOV", "--skip-extension", ".MP4"]
+        )
+
+        self.assertEqual(args.skip_extension, [".MOV", ".MP4"])
+
+    def test_normalizes_dotted_undotted_and_mixed_case_extensions(self) -> None:
+        self.assertEqual(
+            normalize_skip_extensions(["MOV", ".mov", ".mOv"]), frozenset({"mov"})
+        )
+
+    def test_rejects_empty_extension(self) -> None:
+        with self.assertRaises(ValueError):
+            normalize_skip_extensions(["."])
+
+
 class PeriodTests(unittest.TestCase):
     def test_month_matches_only_the_requested_month_prefix(self) -> None:
         period = Period.parse("202610")
@@ -121,6 +141,27 @@ class SelectionTests(unittest.TestCase):
         )
         self.assertEqual(selection.total_size, 3)
 
+    def test_skips_matching_extensions_without_matching_filename_subject(self) -> None:
+        backend = FakeBackend()
+        storage = [
+            FakeItem.folder(
+                "202607_a",
+                FakeItem("clip.MoV", b"video"),
+                FakeItem("MOV_notes.JPG", b"photo"),
+                FakeItem("clip.MOV.bak", b"backup"),
+            )
+        ]
+
+        selection = collect_source_selection(
+            backend, storage, Period.parse("202607"), [".mov"]
+        )
+
+        self.assertEqual(selection.skipped_count, 1)
+        self.assertEqual(
+            [source.relative_parts[-1] for source in selection.files],
+            ["clip.MOV.bak", "MOV_notes.JPG"],
+        )
+
     def test_raises_when_no_folder_matches(self) -> None:
         with self.assertRaisesRegex(IPhoneCopyError, "没有匹配"):
             collect_source_selection(
@@ -159,6 +200,27 @@ class CopyAndVerificationTests(unittest.TestCase):
             ),
         )
         return backend, selection
+
+    def test_skipped_mov_is_not_copied(self) -> None:
+        backend = FakeBackend()
+        storage = [
+            FakeItem.folder(
+                "202607_a",
+                FakeItem("photo.JPG", b"photo"),
+                FakeItem("video.MOV", b"video"),
+            )
+        ]
+        selection = collect_source_selection(
+            backend, storage, Period.parse("202607"), ["MOV"]
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            copied, skipped = copy_selection(
+                backend, selection, Path(temporary_directory), timeout=1
+            )
+
+        self.assertEqual((copied, skipped), (1, 0))
+        self.assertEqual(backend.copy_calls, ["photo.JPG"])
 
     def test_copies_files_then_verifies_paths_count_and_size(self) -> None:
         backend, selection = self._selection()

@@ -13,6 +13,11 @@ Internal Storage**.
 - Select one month with `YYYYMM`, such as `202610`.
 - Select all valid months in one year with `YYYY`, such as `2026`.
 - Copy nested photos and videos while preserving their folder structure.
+- Skip source files by extension with `--skip-extension`; matching ignores case,
+  accepts `MOV` or `.MOV`, and supports repeating the option for multiple
+  extensions.
+- Skip extension-matched files while building the source manifest, so they
+  never start an MTP copy; the output reports how many files were skipped.
 - Skip existing files when their sizes match.
 - Refuse conflicting files unless you specify `--overwrite`.
 - Detect missing, extra, and wrong-size files after the copy.
@@ -83,8 +88,26 @@ python iphone_copy.py 202610 --list-only
 To use another destination, run:
 
 ```powershell
-python iphone_copy.py 202610 --destination "D:\iPhone backup"
+python iphone_copy.py 202610 --destination "$env:USERPROFILE\OneDrive"
 ```
+
+To skip all MOV files while copying to OneDrive, run this PowerShell command:
+
+```powershell
+python .\iphone_copy.py 202607 --destination "$env:USERPROFILE\OneDrive" --skip-extension .MOV
+```
+
+The extension match is case-insensitive, and the leading dot is optional. Repeat
+`--skip-extension` to skip more than one extension:
+
+```powershell
+python .\iphone_copy.py 202607 --skip-extension MOV --skip-extension .MP4
+```
+
+Skipped files are excluded while the source manifest is built, so the tool
+never starts an MTP copy for them. The command reports the number of skipped
+files. This is separate from the existing behavior that skips destination
+files when their sizes already match.
 
 To see all command options, run:
 
